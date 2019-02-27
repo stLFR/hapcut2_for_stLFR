@@ -1,0 +1,129 @@
+#### we used the hapcut2 for 10X data pipeline for phasing analysis on stLFR data. So we converted bam files into a format that resembles 10X data to be used as input for hapcut2 analysis.
+#### the input bam file was generated ruing the 'mapping' step
+
+
+###########################################################################
+####   filter for reads with assigned barcodes and remove duplicates   ####
+###########################################################################
+
+samtools view -h -F 0x400 L0.sort.rmdup.bam | awk -F $'\t' '($1!~/#0_0_0$/){print}' > L0.sort.removedup_rm000.sam
+
+
+
+###########################################################################
+####          run phasing with hapcut2 for 10X data pipeline           ####
+###########################################################################
+align_sam=path_to_L0.sort.removedup_rm000.sam
+laneid=L0
+
+
+linkdist=100000
+linkfragment_py=path_to_LinkFragments.py_in_hapcut2_installation
+contig_size=path_to_hg19.chrom.sizes_in_hapcut2_installation
+compare_block_py=path_to_calculate_haplotype_statistics.py_in_hapcut2_installation
+
+#### for NA12878, the accuracy of phasing can be calculated by comparing to the phased vcf file provided by GIAB (ftp://ftp-trace.ncbi.nlm.nih.gov/giab/ftp/release/NA12878_HG001/latest/GRCh37/HG001_GRCh37_GIAB_highconf_CG-IllFB-IllGATKHC-Ion-10X-SOLID_CHROM1-X_v.3.3.2_highconf_PGandRTGphasetransfer.vcf.gz )
+
+
+
+#### step1: modify bam file to add BX field with barcode information (to have a similar format as 10X data)
+mkdir step1_modify_bam
+cd step1_modify_bam
+
+awk -F $'\t' '{if($1~/#/){barcode=split($1,a,"#")
+print $0,"BX:Z:"a[2]}
+else{print}
+}' OFS="\t" $align_sam > ${laneid}_sort.rmdup.addBX.sam
+
+samtools view -bh ${laneid}_sort.rmdup.addBX.sam > ${laneid}_sort.rmdup.addBX.bam 
+samtools index ${laneid}_sort.rmdup.addBX.bam 
+
+
+for i in {chr1,chr2,chr3,chr4,chr5,chr6,chr7,chr8,chr9,chr10,chr11,chr12,chr13,chr14,chr15,chr16,chr17,chr18,chr19,chr20,chr21,chr22,chrX}
+do
+
+echo $i
+samtools view -bh ${laneid}_sort.rmdup.addBX.bam $i > ${laneid}_sort.rmdup.addBX_${i}.bam && samtools index ${laneid}_sort.rmdup.addBX_${i}.bam &
+
+done
+
+wait
+cd ../
+
+
+#### step1_2: split input vcf by chromosome
+mkdir step1_2_split_vcf
+cd step1_2_split_vcf
+
+for i in {chr1,chr2,chr3,chr4,chr5,chr6,chr7,chr8,chr9,chr10,chr11,chr12,chr13,chr14,chr15,chr16,chr17,chr18,chr19,chr20,chr21,chr22,chrX}
+do
+
+awk -F $'\t' -v chrid=$i '($1~/#/ || $1==chrid){print}' path_to_input_vcf > ${vcf_prefix}_${i}.vcf
+
+done
+
+cd ../
+date
+
+#### step2: running hapcut2
+vcf_dir=../step1_2_split_vcf
+
+
+mkdir step2_run_hapcut2_10xpipeline
+cd step2_run_hapcut2_10xpipeline
+
+
+mkdir s1_unlinked_frag
+mkdir s2_link_frag_files
+mkdir s3_hapcut_output
+
+for i in {chr1,chr2,chr3,chr4,chr5,chr6,chr7,chr8,chr9,chr10,chr11,chr12,chr13,chr14,chr15,chr16,chr17,chr18,chr19,chr20,chr21,chr22,chrX}
+do
+echo $i
+
+bamfile=../step1_modify_bam/${laneid}_sort.rmdup.addBX_${i}.bam 
+
+echo "date && extractHAIRS --10X 1 --bam "$bamfile" --VCF "${vcf_dir}"/"${vcf_prefix}"_"${i}".vcf --out s1_unlinked_frag/unlinked_fragment_"${laneid}"_"${i}" && python3 "$linkfragment_py" --bam "$bamfile" --vcf "${vcf_dir}"/"${vcf_prefix}"_"${i}".vcf --fragments s1_unlinked_frag/unlinked_fragment_"${laneid}"_"${i}" --out s2_link_frag_files/linked_frag_"${laneid}"_"${i}" -d "$linkdist" && HAPCUT2 --nf 1 --fragments s2_link_frag_files/linked_frag_"${laneid}"_"${i}" --vcf "${vcf_dir}"/"${vcf_prefix}"_"${i}".vcf --output s3_hapcut_output/hapblock_"${laneid}"_"${i}" && date" > run_hapcut_for_${i}.sh
+nohup sh run_hapcut_for_${i}.sh > hapcut_${i}.log &
+ 
+done
+
+wait
+cd ../
+
+
+##########################################
+#### calculate phasing error rate by comparing with a reference phased vcf file
+mkdir step3_compare_with_refphasing
+cd step3_compare_with_refphasing
+
+output_file=hapcut_comparison_with_${ref_phased_vcf_prefix}.txt
+h1_prefix=../step2_run_hapcut2_10xpipeline/s3_hapcut_output/hapblock_${laneid}
+v1_prefix=${vcf_dir}/${vcf_prefix}
+f1_prefix=../step2_run_hapcut2_10xpipeline/s2_link_frag_files/linked_frag_${laneid}
+
+pv_prefix=${ref_phased_vcf_dir}/${ref_phased_vcf_prefix}
+
+echo "compare ${laneid} with ${ref_phased_vcf_prefix}" > ${output_file}
+
+for i in {chr1,chr2,chr3,chr4,chr5,chr6,chr7,chr8,chr9,chr10,chr11,chr12,chr13,chr14,chr15,chr16,chr17,chr18,chr19,chr20,chr21,chr22,chrX}
+do
+
+echo $i >> ${output_file}
+
+python3 ${compare_block_py} -h1 ${h1_prefix}_${i} -v1 ${v1_prefix}_${i}.vcf -f1 ${f1_prefix}_${i} -pv ${pv_prefix}_${i}.vcf -c $contig_size >> ${output_file}
+
+done
+
+#######################
+echo "combine all chrs" >> ${output_file}
+
+python3 ${compare_block_py} -h1 ${h1_prefix}_chr1 ${h1_prefix}_chr2 ${h1_prefix}_chr3 ${h1_prefix}_chr4 ${h1_prefix}_chr5 ${h1_prefix}_chr6 ${h1_prefix}_chr7 ${h1_prefix}_chr8 ${h1_prefix}_chr9 ${h1_prefix}_chr10 ${h1_prefix}_chr11 ${h1_prefix}_chr12 ${h1_prefix}_chr13 ${h1_prefix}_chr14 ${h1_prefix}_chr15 ${h1_prefix}_chr16 ${h1_prefix}_chr17 ${h1_prefix}_chr18 ${h1_prefix}_chr19 ${h1_prefix}_chr20 ${h1_prefix}_chr21 ${h1_prefix}_chr22 ${h1_prefix}_chrX -v1 ${v1_prefix}_chr1.vcf ${v1_prefix}_chr2.vcf ${v1_prefix}_chr3.vcf ${v1_prefix}_chr4.vcf ${v1_prefix}_chr5.vcf ${v1_prefix}_chr6.vcf ${v1_prefix}_chr7.vcf ${v1_prefix}_chr8.vcf ${v1_prefix}_chr9.vcf ${v1_prefix}_chr10.vcf ${v1_prefix}_chr11.vcf ${v1_prefix}_chr12.vcf ${v1_prefix}_chr13.vcf ${v1_prefix}_chr14.vcf ${v1_prefix}_chr15.vcf ${v1_prefix}_chr16.vcf ${v1_prefix}_chr17.vcf ${v1_prefix}_chr18.vcf ${v1_prefix}_chr19.vcf ${v1_prefix}_chr20.vcf ${v1_prefix}_chr21.vcf ${v1_prefix}_chr22.vcf ${v1_prefix}_chrX.vcf -f1 ${f1_prefix}_chr1 ${f1_prefix}_chr2 ${f1_prefix}_chr3 ${f1_prefix}_chr4 ${f1_prefix}_chr5 ${f1_prefix}_chr6 ${f1_prefix}_chr7 ${f1_prefix}_chr8 ${f1_prefix}_chr9 ${f1_prefix}_chr10 ${f1_prefix}_chr11 ${f1_prefix}_chr12 ${f1_prefix}_chr13 ${f1_prefix}_chr14 ${f1_prefix}_chr15 ${f1_prefix}_chr16 ${f1_prefix}_chr17 ${f1_prefix}_chr18 ${f1_prefix}_chr19 ${f1_prefix}_chr20 ${f1_prefix}_chr21 ${f1_prefix}_chr22 ${f1_prefix}_chrX -pv ${pv_prefix}_chr1.vcf ${pv_prefix}_chr2.vcf ${pv_prefix}_chr3.vcf ${pv_prefix}_chr4.vcf ${pv_prefix}_chr5.vcf ${pv_prefix}_chr6.vcf ${pv_prefix}_chr7.vcf ${pv_prefix}_chr8.vcf ${pv_prefix}_chr9.vcf ${pv_prefix}_chr10.vcf ${pv_prefix}_chr11.vcf ${pv_prefix}_chr12.vcf ${pv_prefix}_chr13.vcf ${pv_prefix}_chr14.vcf ${pv_prefix}_chr15.vcf ${pv_prefix}_chr16.vcf ${pv_prefix}_chr17.vcf ${pv_prefix}_chr18.vcf ${pv_prefix}_chr19.vcf ${pv_prefix}_chr20.vcf ${pv_prefix}_chr21.vcf ${pv_prefix}_chr22.vcf ${pv_prefix}_chrX.vcf -c $contig_size >> ${output_file}
+
+
+cd ../
+
+
+
+
+
